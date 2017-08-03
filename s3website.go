@@ -1,30 +1,23 @@
-package main
+package s3website
 
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
-	"flag"
-	"io/ioutil"
-	"log"
+	"io"
 	"mime"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 var (
-	config struct {
-		addr, profile, region, bucket string
-	}
-
+	base64Encoding           = base64.StdEncoding.WithPadding(base64.NoPadding)
 	compressableContentTypes = map[string]bool{
 		"application/eot":               true,
 		"application/font":              true,
@@ -80,6 +73,12 @@ func acceptEncodingGzip(req *http.Request) bool {
 
 	return false
 }
+
+type nopWriteCloser struct {
+	io.Writer
+}
+
+func (nopWriteCloser) Close() error { return nil }
 
 type S3Website struct {
 	client *s3.S3
@@ -141,52 +140,55 @@ func (s *S3Website) serveFile(w http.ResponseWriter, req *http.Request, key stri
 		return
 	}
 
-	data, err := ioutil.ReadAll(getObjectOutput.Body)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	// Get the file content-type from the S3 output.
+	var fileContentType string
+	if getObjectOutput.ContentType != nil {
+		fileContentType = *getObjectOutput.ContentType
 	}
 
-	fileContentType := w.Header().Get("content-type")
+	// If the content-type wasn't set in the S3 output, try to guess it based on
+	// the file extension.
 	if fileContentType == "" {
 		fileContentType = mime.TypeByExtension(filepath.Ext(key))
 	}
 
-	if fileContentType == "" {
-		fileContentType = http.DetectContentType(data)
+	// Set the response Content-Type header.
+	if fileContentType != "" {
+		w.Header().Set("content-type", fileContentType)
 	}
+
+	var data *bytes.Buffer
+	if getObjectOutput.ContentLength != nil {
+		data = bytes.NewBuffer(make([]byte, 0, *getObjectOutput.ContentLength))
+	} else {
+		data = bytes.NewBuffer([]byte{})
+	}
+
+	var dataWriteCloser io.WriteCloser
 
 	gzipEncoded := false
 	if compressableContentTypes[strings.Split(fileContentType, ";")[0]] && acceptEncodingGzip(req) {
-		compressedData := bytes.NewBuffer(make([]byte, 0, len(data)))
-		gzipWriter := gzip.NewWriter(compressedData)
-		if _, err := gzipWriter.Write(data); err != nil {
-			log.Println(err)
-			http.Error(w, "an error occurred", http.StatusInternalServerError)
-			return
-		}
-
-		if err := gzipWriter.Close(); err != nil {
-			log.Println(err)
-			http.Error(w, "an error occurred", http.StatusInternalServerError)
-			return
-		}
-
 		gzipEncoded = true
-		data = compressedData.Bytes()
+		dataWriteCloser = gzip.NewWriter(data)
+	} else {
+		dataWriteCloser = nopWriteCloser{data}
 	}
 
-	// Get the SHA1 hash value for the file.
-	fileHash := sha1.New()
-	if _, err := fileHash.Write(data); err != nil {
-		log.Println(err)
-		http.Error(w, "an error occurred", http.StatusInternalServerError)
+	fileHash := sha256.New()
+	dataMultiWriter := io.MultiWriter(dataWriteCloser, fileHash)
+	if _, err := io.Copy(dataMultiWriter, getObjectOutput.Body); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Set an ETag header based on the SHA1 hash.
+	if err := dataWriteCloser.Close(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Set an ETag header based on the SHA256 hash.
 	fileHashSum := fileHash.Sum(nil)
-	etag := `"` + base64.StdEncoding.EncodeToString(fileHashSum) + `"`
+	etag := `"` + base64Encoding.EncodeToString(fileHashSum) + `"`
 	w.Header().Set("etag", etag)
 
 	// If the file is gzip-encoded, set a Content-Encoding header.
@@ -205,7 +207,7 @@ func (s *S3Website) serveFile(w http.ResponseWriter, req *http.Request, key stri
 		w.Header().Set("cache-control", "max-age=60")
 	}
 
-	http.ServeContent(w, req, key, aws.TimeValue(getObjectOutput.LastModified), bytes.NewReader(data))
+	http.ServeContent(w, req, key, aws.TimeValue(getObjectOutput.LastModified), bytes.NewReader(data.Bytes()))
 }
 
 func (s *S3Website) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -238,49 +240,4 @@ func (s *S3Website) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	http.NotFound(w, req)
-}
-
-func init() {
-	flag.StringVar(&config.addr, "a", "127.0.0.1:8080", "address to listen on")
-	flag.StringVar(&config.profile, "profile", "", "aws profile to use")
-	flag.StringVar(&config.region, "region", "", "aws region to use")
-	flag.StringVar(&config.bucket, "bucket", "", "bucket to use")
-}
-
-func getenv(p string, key, defaultValue string) string {
-	if p != "" {
-		return p
-	}
-
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-
-	return defaultValue
-}
-
-func main() {
-	flag.Parse()
-
-	config.profile = getenv(config.profile, "AWS_PROFILE", "default")
-	config.region = getenv(config.region, "AWS_REGION", "us-east-1")
-	config.bucket = getenv(config.bucket, "AWS_BUCKET", "")
-
-	awsSessionOptions := session.Options{
-		Profile: config.profile,
-		Config: aws.Config{
-			Region: aws.String(config.region),
-			CredentialsChainVerboseErrors: aws.Bool(true),
-		},
-	}
-
-	awsSession, err := session.NewSessionWithOptions(awsSessionOptions)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	s3Website := NewS3Website(s3.New(awsSession), config.bucket)
-
-	log.Println(config.addr)
-	log.Fatal(http.ListenAndServe(config.addr, s3Website))
 }
